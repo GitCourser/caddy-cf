@@ -1,0 +1,153 @@
+name: Build and Publish Caddy with Cloudflare Plugin
+
+on:
+  # 手动触发,可指定 Caddy 版本
+  workflow_dispatch:
+    inputs:
+      caddy_version:
+        description: "Caddy version (e.g. 2.8.4). Leave empty to use latest stable."
+        required: false
+        default: ""
+      force_build:
+        description: "Force build even if image tag already exists"
+        type: boolean
+        required: false
+        default: false
+  # 定期检查:每周日 00:00 UTC 自动构建最新稳定版
+  schedule:
+    - cron: "0 0 * * 0"
+  # 主分支推送时构建
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/build.yml"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ===== 检查最新稳定版 Caddy =====
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      caddy_version: ${{ steps.get_version.outputs.caddy_version }}
+      should_build: ${{ steps.check_existing.outputs.should_build }}
+    steps:
+      - name: Get latest stable Caddy version
+        id: get_version
+        run: |
+          # 优先使用手动输入的版本号
+          if [ -n "${{ github.event.inputs.caddy_version }}" ]; then
+            VERSION="${{ github.event.inputs.caddy_version }}"
+            # 去掉可能的前缀 v
+            VERSION="${VERSION#v}"
+          else
+            # 通过 GitHub Releases API 获取最新稳定版
+            VERSION=$(curl -fsSL https://api.github.com/repos/caddyserver/caddy/releases/latest \
+              | jq -r '.tag_name' \
+              | sed 's/^v//')
+            if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+              echo "Failed to fetch latest Caddy version"
+              exit 1
+            fi
+          fi
+          echo "caddy_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::Resolved Caddy version: $VERSION"
+
+      - name: Determine if build is needed
+        id: check_existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.get_version.outputs.caddy_version }}"
+
+          # 强制构建:手动触发且 force_build=true 时直接构建
+          if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Force build requested, will build"
+            exit 0
+          fi
+
+          # 非手动触发(schedule/push)默认构建
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Triggered by ${{ github.event_name }}, will build"
+            exit 0
+          fi
+
+          # 手动触发但未强制:检查 GHCR 中是否已存在对应 tag
+          if docker manifest inspect ${{ env.REGISTRY }}/${{ github.repository }}:${VERSION} >/dev/null 2>&1; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Image tag ${VERSION} already exists, skipping build"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Image tag ${VERSION} does not exist, will build"
+          fi
+
+  # ===== 构建多架构 Docker 镜像并推送到 GHCR =====
+  build-and-push:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.check-version.outputs.caddy_version }}
+            type=raw,value=cloudflare-${{ needs.check-version.outputs.caddy_version }}
+          labels: |
+            org.opencontainers.image.title=Caddy with Cloudflare DNS plugin
+            org.opencontainers.image.description=Custom Caddy build with caddy-dns/cloudflare plugin
+            org.opencontainers.image.version=${{ needs.check-version.outputs.caddy_version }}
+
+      - name: Build and push multi-arch Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CADDY_VERSION=${{ needs.check-version.outputs.caddy_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Generate build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Caddy version**: \`${{ needs.check-version.outputs.caddy_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Plugin**: \`github.com/caddy-dns/cloudflare\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platforms**: \`linux/amd64\`, \`linux/arm64\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Registry**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags**:" >> $GITHUB_STEP_SUMMARY
+          echo "  - \`latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "  - \`${{ needs.check-version.outputs.caddy_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "  - \`cloudflare-${{ needs.check-version.outputs.caddy_version }}\`" >> $GITHUB_STEP_SUMMARY
