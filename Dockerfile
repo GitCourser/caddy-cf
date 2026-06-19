@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # Caddy 版本号,优先由 workflow 通过 --build-arg 传入
 ARG CADDY_VERSION=2.11.4
 
@@ -34,3 +32,7 @@ RUN if [ "$TARGETARCH" = "$BUILDARCH" ]; then \
 FROM caddy:${CADDY_VERSION}-alpine
 
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+
+WORKDIR /srv
+
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
