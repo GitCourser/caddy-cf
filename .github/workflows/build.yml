@@ -13,7 +13,7 @@ on:
         type: boolean
         required: false
         default: false
-  # 定期检查:每周日 00:00 UTC 自动构建最新稳定版
+  # 定期检查:每周日 00:00 UTC 获取 Docker Hub 最新稳定版, GHCR 中已存在该版本时自动跳过
   schedule:
     - cron: "0 0 * * 0"
   # 主分支推送时构建
@@ -29,14 +29,14 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # ===== 检查最新稳定版 Caddy =====
+  # ===== 检查 Docker Hub 上最新稳定版 Caddy =====
   check-version:
     runs-on: ubuntu-latest
     outputs:
       caddy_version: ${{ steps.get_version.outputs.caddy_version }}
       should_build: ${{ steps.check_existing.outputs.should_build }}
     steps:
-      - name: Get latest stable Caddy version
+      - name: Get latest stable Caddy version from Docker Hub
         id: get_version
         run: |
           # 优先使用手动输入的版本号
@@ -45,24 +45,32 @@ jobs:
             # 去掉可能的前缀 v
             VERSION="${VERSION#v}"
           else
-            # 通过 GitHub Releases API 获取最新稳定版
-            VERSION=$(curl -fsSL https://api.github.com/repos/caddyserver/caddy/releases/latest \
-              | jq -r '.tag_name' \
-              | sed 's/^v//')
+            # 从 Docker Hub library/caddy 的镜像 tag 解析最新完整版本号
+            # 镜像 tag 即真实发布的镜像版本, 避免 git tag 高于已发布镜像导致拉取基础镜像失败
+            VERSION=$(curl -fsSL "https://hub.docker.com/v2/repositories/library/caddy/tags?page_size=100" \
+              | jq -r '[.results[].name | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(split(".") | map(tonumber)) | last')
             if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-              echo "Failed to fetch latest Caddy version"
+              echo "Failed to fetch latest Caddy version from Docker Hub"
               exit 1
             fi
           fi
+
+          # 校验 Dockerfile 依赖的基础镜像 tag 真实存在(-builder 与 -alpine)
+          for SUFFIX in builder alpine; do
+            if ! curl -fsSL -o /dev/null "https://hub.docker.com/v2/repositories/library/caddy/tags/${VERSION}-${SUFFIX}"; then
+              echo "::error::caddy:${VERSION}-${SUFFIX} does not exist on Docker Hub"
+              exit 1
+            fi
+          done
+
           echo "caddy_version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "::notice::Resolved Caddy version: $VERSION"
 
       - name: Determine if build is needed
         id: check_existing
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.get_version.outputs.caddy_version }}"
+          IMAGE="${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
 
           # 强制构建:手动触发且 force_build=true 时直接构建
           if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
@@ -71,20 +79,20 @@ jobs:
             exit 0
           fi
 
-          # 非手动触发(schedule/push)默认构建
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+          # push 触发意味着 Dockerfile 或 workflow 有变更, 直接重新构建
+          if [ "${{ github.event_name }}" = "push" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Triggered by ${{ github.event_name }}, will build"
+            echo "::notice::Triggered by push, will build"
             exit 0
           fi
 
-          # 手动触发但未强制:检查 GHCR 中是否已存在对应 tag
-          if docker manifest inspect ${{ env.REGISTRY }}/${{ github.repository }}:${VERSION} >/dev/null 2>&1; then
+          # schedule / 手动触发: GHCR 中该版本 tag 已存在则跳过, 避免重复构建相同版本
+          if docker manifest inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Image tag ${VERSION} already exists, skipping build"
+            echo "::notice::Image ${IMAGE}:${VERSION} already exists, skipping build"
           else
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Image tag ${VERSION} does not exist, will build"
+            echo "::notice::Image ${IMAGE}:${VERSION} does not exist, will build"
           fi
 
   # ===== 构建多架构 Docker 镜像并推送到 GHCR =====
